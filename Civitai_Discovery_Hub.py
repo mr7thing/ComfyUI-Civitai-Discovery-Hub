@@ -331,24 +331,25 @@ async def _download_image_to_tensor_async(url: str, timeout_s: int = 30) -> torc
 
 def _download_image_to_tensor(url: str, timeout_s: int = 30) -> torch.Tensor:
     """
-    同步包装器：在事件循环中运行异步下载
+    同步包装器：在独立线程中运行异步下载
     
-    注意：此函数在 ComfyUI 节点执行时被调用，需要兼容同步上下文
+    注意：此函数在 ComfyUI 节点执行时被调用，需要兼容同步上下文。
+    ComfyUI 可能已经有一个事件循环在运行，所以我们需要在新线程中运行 asyncio。
     """
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # 如果已经在事件循环中，创建新任务
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, _download_image_to_tensor_async(url, timeout_s))
-                return future.result()
-        else:
-            # 无事件循环，直接运行
-            return loop.run_until_complete(_download_image_to_tensor_async(url, timeout_s))
-    except RuntimeError:
-        # 无事件循环，创建新的
-        return asyncio.run(_download_image_to_tensor_async(url, timeout_s))
+    import concurrent.futures
+    
+    def run_async_in_thread():
+        """在新线程中运行异步函数"""
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+        try:
+            return new_loop.run_until_complete(_download_image_to_tensor_async(url, timeout_s))
+        finally:
+            new_loop.close()
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(run_async_in_thread)
+        return future.result()
 
 
 def extract_prompts_from_workflow(workflow_json: str) -> tuple[str, str]:
