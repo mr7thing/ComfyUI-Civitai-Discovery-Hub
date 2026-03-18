@@ -1,9 +1,10 @@
 # ----- SECTION: Imports -----
+import asyncio
+import concurrent.futures
 import io
 import json
 import os
 import time
-import urllib.request
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -20,6 +21,214 @@ from comfy_api.latest import ComfyExtension, io as comfy_io
 # ----- SECTION: Constants -----
 NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 FAVORITES_FILE = os.path.join(NODE_DIR, "civitai_favorites.json")
+CONFIG_FILE = os.path.join(NODE_DIR, "config.json")
+
+
+# ----- SECTION: Config Management -----
+# 配置缓存状态
+_config_cache: Optional[Dict[str, Any]] = None
+_config_mtime: float = 0
+
+
+def load_config(force_reload: bool = False) -> Dict[str, Any]:
+    """Load configuration from config.json file with caching and hot-reload support"""
+    global _config_cache, _config_mtime
+    
+    # 检查是否需要重新加载
+    if not force_reload and _config_cache is not None:
+        try:
+            current_mtime = os.path.getmtime(CONFIG_FILE)
+            if current_mtime == _config_mtime:
+                return _config_cache
+        except OSError:
+            pass
+    
+    # 重新加载配置
+    config = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            _config_mtime = os.path.getmtime(CONFIG_FILE)
+            print(f"CivitaiDiscoveryHub: Config loaded from {CONFIG_FILE}")
+        except Exception as e:
+            print(f"CivitaiDiscoveryHub: Error loading config: {e}")
+    
+    _config_cache = config if isinstance(config, dict) else {}
+    return _config_cache
+
+
+def reload_config() -> Dict[str, Any]:
+    """Force reload configuration from disk"""
+    return load_config(force_reload=True)
+
+
+def get_civitai_api_key() -> Optional[str]:
+    """Get Civitai API key from environment variable or config file"""
+    # First try environment variable
+    api_key = os.environ.get("CIVITAI_API_KEY")
+    if api_key:
+        return api_key.strip()
+    
+    # Then try config file
+    config = load_config()
+    api_key = config.get("api_key")
+    if api_key:
+        return str(api_key).strip()
+    
+    return None
+
+
+def get_proxy_settings() -> Dict[str, Any]:
+    """Get proxy settings from config file"""
+    config = load_config()
+    proxy_settings = config.get("proxy", {})
+    if not isinstance(proxy_settings, dict):
+        proxy_settings = {}
+    
+    return {
+        "enabled": bool(proxy_settings.get("enabled", False)),
+        "type": str(proxy_settings.get("type", "http")).lower(),
+        "host": str(proxy_settings.get("host", "127.0.0.1")),
+        "port": int(proxy_settings.get("port", 10808)),
+        "username": str(proxy_settings.get("username", "")) if proxy_settings.get("username") else None,
+        "password": str(proxy_settings.get("password", "")) if proxy_settings.get("password") else None,
+    }
+
+
+def get_proxy_url() -> Optional[str]:
+    """Get proxy URL string, returns None if proxy is disabled"""
+    settings = get_proxy_settings()
+    if not settings["enabled"]:
+        return None
+    
+    auth = ""
+    if settings["username"] and settings["password"]:
+        auth = f"{settings['username']}:{settings['password']}@"
+    
+    return f"{settings['type']}://{auth}{settings['host']}:{settings['port']}"
+
+
+# ----- SECTION: Unified HTTP Client -----
+class CivitaiHttpClient:
+    """
+    统一管理的 HTTP 客户端，支持代理热切换
+    
+    设计原则：
+    - 单例模式：全局唯一实例
+    - 自动代理检测：配置变化时自动重建 session
+    - 连接池复用：减少 TCP 握手开销
+    """
+    
+    _instance: Optional["CivitaiHttpClient"] = None
+    _lock: asyncio.Lock = asyncio.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._session: Optional[aiohttp.ClientSession] = None
+            cls._instance._current_proxy: Optional[str] = None
+            cls._instance._closed = False
+        return cls._instance
+    
+    def _get_auth_headers(self) -> Dict[str, str]:
+        """获取带 API Key 的请求头"""
+        headers = {"User-Agent": "Mozilla/5.0"}
+        api_key = get_civitai_api_key()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+    
+    async def get_session(self) -> aiohttp.ClientSession:
+        """获取或创建 session，自动检测代理变化并重建"""
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("HttpClient has been closed")
+            
+            proxy_url = get_proxy_url()
+            
+            # 代理配置变化时需要重建 session
+            need_rebuild = (
+                proxy_url != self._current_proxy
+                or self._session is None
+                or self._session.closed
+            )
+            
+            if need_rebuild:
+                # 关闭旧 session
+                if self._session and not self._session.closed:
+                    await self._session.close()
+                
+                # 创建新 connector
+                if proxy_url:
+                    connector = aiohttp.TCPConnector(
+                        proxy=proxy_url,
+                        limit=100,
+                        limit_per_host=30,
+                        ttl_dns_cache=300,
+                    )
+                    print(f"CivitaiDiscoveryHub: HTTP client using proxy {proxy_url.split('@')[-1]}")
+                else:
+                    connector = aiohttp.TCPConnector(
+                        limit=100,
+                        limit_per_host=30,
+                        ttl_dns_cache=300,
+                    )
+                    print("CivitaiDiscoveryHub: HTTP client using direct connection")
+                
+                # 创建新 session
+                timeout = aiohttp.ClientTimeout(total=60, connect=10)
+                self._session = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=timeout,
+                    headers=self._get_auth_headers(),
+                )
+                self._current_proxy = proxy_url
+            
+            return self._session
+    
+    async def request(
+        self,
+        method: str,
+        url: str,
+        **kwargs
+    ) -> aiohttp.ClientResponse:
+        """发送 HTTP 请求"""
+        session = await self.get_session()
+        return await session.request(method, url, **kwargs)
+    
+    async def get(self, url: str, **kwargs) -> aiohttp.ClientResponse:
+        """发送 GET 请求"""
+        return await self.request("GET", url, **kwargs)
+    
+    async def post(self, url: str, **kwargs) -> aiohttp.ClientResponse:
+        """发送 POST 请求"""
+        return await self.request("POST", url, **kwargs)
+    
+    async def close(self):
+        """关闭客户端，释放资源"""
+        async with self._lock:
+            self._closed = True
+            if self._session and not self._session.closed:
+                await self._session.close()
+                self._session = None
+            self._current_proxy = None
+    
+    async def reload_proxy(self) -> Dict[str, Any]:
+        """强制重新加载代理配置并重建 session"""
+        reload_config()
+        async with self._lock:
+            self._current_proxy = None  # 强制触发重建
+        session = await self.get_session()
+        return {
+            "status": "success",
+            "proxy": self._current_proxy.split("@")[-1] if self._current_proxy else None,
+            "enabled": self._current_proxy is not None,
+        }
+
+
+# 全局 HTTP 客户端实例
+http_client = CivitaiHttpClient()
 
 
 # ----- SECTION: Favorites Storage -----
@@ -100,10 +309,15 @@ def _empty_image_tensor() -> torch.Tensor:
     return torch.zeros(1, 1, 1, 3, dtype=torch.float32)
 
 
-def _download_image_to_tensor(url: str, timeout_s: int = 30) -> torch.Tensor:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        data = resp.read()
+async def _download_image_to_tensor_async(url: str, timeout_s: int = 30) -> torch.Tensor:
+    """异步下载图片并转换为 tensor，使用统一 HTTP 客户端"""
+    session = await http_client.get_session()
+    
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"Failed to download image: HTTP {resp.status}")
+        data = await resp.read()
+    
     img = Image.open(io.BytesIO(data))
     if getattr(img, "is_animated", False):
         try:
@@ -113,6 +327,145 @@ def _download_image_to_tensor(url: str, timeout_s: int = 30) -> torch.Tensor:
     img = img.convert("RGB")
     arr = np.array(img).astype(np.float32) / 255.0
     return torch.from_numpy(arr)[None, ...]
+
+
+def _download_image_to_tensor(url: str, timeout_s: int = 30) -> torch.Tensor:
+    """
+    同步包装器：在事件循环中运行异步下载
+    
+    注意：此函数在 ComfyUI 节点执行时被调用，需要兼容同步上下文
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # 如果已经在事件循环中，创建新任务
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, _download_image_to_tensor_async(url, timeout_s))
+                return future.result()
+        else:
+            # 无事件循环，直接运行
+            return loop.run_until_complete(_download_image_to_tensor_async(url, timeout_s))
+    except RuntimeError:
+        # 无事件循环，创建新的
+        return asyncio.run(_download_image_to_tensor_async(url, timeout_s))
+
+
+def extract_prompts_from_workflow(workflow_json: str) -> tuple[str, str]:
+    """Extract prompts from workflow by tracing CLIPTextEncode nodes' text inputs"""
+    try:
+        # Parse workflow JSON
+        workflow_data = json.loads(workflow_json)
+    except json.JSONDecodeError:
+        return "", ""
+    
+    # Get nodes from workflow
+    nodes = workflow_data.get("workflow", {}).get("nodes", [])
+    if not nodes:
+        return "", ""
+    
+    # Create node dictionary for quick lookup
+    node_dict = {str(node.get("id")): node for node in nodes}
+    
+    # Function to trace text input recursively
+    def trace_text_input(node_id: str, visited: set) -> str:
+        if node_id in visited:
+            return ""
+        visited.add(node_id)
+        
+        node = node_dict.get(node_id)
+        if not node:
+            return ""
+        
+        node_type = node.get("type", "")
+        widgets_values = node.get("widgets_values", [])
+        
+        # Check if this is a text display node
+        if "ShowText" in node_type or "show text" in node_type.lower():
+            # Extract text from widgets_values
+            for value in widgets_values:
+                if isinstance(value, str):
+                    return value
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, str):
+                            return item
+        
+        # Check if this node has text input widgets
+        inputs = node.get("inputs", [])
+        for input_info in inputs:
+            if input_info.get("name") in ["text", "string"]:
+                # Check if it has a widget with text
+                widget = input_info.get("widget")
+                if widget:
+                    # For simple text inputs
+                    if isinstance(widgets_values, list) and widgets_values:
+                        for value in widgets_values:
+                            if isinstance(value, str):
+                                return value
+                # Check if it links to another node
+                                link = input_info.get("link")
+                                if link is not None:
+                                    # Find the node that this link comes from
+                                    for n in nodes:
+                                        outputs = n.get("outputs", [])
+                                        for output in outputs:
+                                            output_links = output.get("links", [])
+                                            if output_links and link in output_links:
+                                                # Trace to the source node
+                                                source_node_id = str(n.get("id"))
+                                                result = trace_text_input(source_node_id, visited)
+                                                if result:
+                                                    return result
+        
+        # Check if this node has any text-like widgets
+        for value in widgets_values:
+            if isinstance(value, str) and len(value) > 10:
+                return value
+        
+        return ""
+    
+    # Find CLIPTextEncode nodes
+    positive_prompt = ""
+    negative_prompt = ""
+    
+    for node in nodes:
+        node_type = node.get("type", "")
+        if node_type == "CLIPTextEncode":
+            node_title = node.get("title", "")
+            inputs = node.get("inputs", [])
+            
+            # Find text input
+            for input_info in inputs:
+                if input_info.get("name") == "text":
+                    link = input_info.get("link")
+                    if link is not None:
+                        # Find the node that this link comes from
+                        for n in nodes:
+                            outputs = n.get("outputs", [])
+                            for output in outputs:
+                                output_links = output.get("links", [])
+                                if output_links and link in output_links:
+                                    source_node_id = str(n.get("id"))
+                                    text = trace_text_input(source_node_id, set())
+                                    if text:
+                                        if "negative" in node_title.lower():
+                                            negative_prompt = text
+                                        else:
+                                            positive_prompt = text
+                    else:
+                        # Check if it has a widget with text
+                        widget = input_info.get("widget")
+                        if widget:
+                            widgets_values = node.get("widgets_values", [])
+                            for value in widgets_values:
+                                if isinstance(value, str):
+                                    if "negative" in node_title.lower():
+                                        negative_prompt = value
+                                    else:
+                                        positive_prompt = value
+    
+    return positive_prompt, negative_prompt
 
 
 # ----- SECTION: Node (V3) -----
@@ -136,6 +489,7 @@ class CivitaiDiscoveryHubNode(comfy_io.ComfyNode):
                 comfy_io.String.Output(display_name="negative_prompt"),
                 comfy_io.Image.Output(display_name="image"),
                 comfy_io.String.Output(display_name="info"),
+                comfy_io.String.Output(display_name="workflow_json"),
             ],
         )
 
@@ -164,9 +518,36 @@ class CivitaiDiscoveryHubNode(comfy_io.ComfyNode):
 
         image_url = str(item_data.get("url") or "") if isinstance(item_data, dict) else ""
 
+        # 处理工作流 JSON
+        workflow_json = ""
+        has_workflow = False
+        if meta and isinstance(meta, dict):
+            comfy_str = meta.get("comfy", "")
+            if comfy_str:
+                try:
+                    # 解析 comfy 字符串为 JSON 对象
+                    workflow_obj = json.loads(comfy_str)
+                    # 转换回字符串，确保 UTF-8 编码正确处理中文
+                    workflow_json = json.dumps(workflow_obj, indent=4, ensure_ascii=False)
+                    has_workflow = True
+                    
+                    # 从工作流中提取提示词
+                    workflow_prompt, workflow_neg_prompt = extract_prompts_from_workflow(workflow_json)
+                    # 更新提示词（如果从工作流中提取到了）
+                    if workflow_prompt:
+                        pos_prompt = workflow_prompt
+                    if workflow_neg_prompt:
+                        neg_prompt = workflow_neg_prompt
+                except json.JSONDecodeError:
+                    pass
+
         info_dict = dict(meta)
         for k in ("prompt", "Prompt", "positive", "textPrompt", "negativePrompt", "NegativePrompt", "negative"):
             info_dict.pop(k, None)
+        
+        # 在 info 中添加工作流标记
+        if has_workflow:
+            info_dict["has_workflow"] = True
 
         try:
             info_string = json.dumps(info_dict, indent=4, ensure_ascii=False)
@@ -181,7 +562,7 @@ class CivitaiDiscoveryHubNode(comfy_io.ComfyNode):
             except Exception:
                 tensor = _empty_image_tensor()
 
-        return (pos_prompt, neg_prompt, tensor, info_string)
+        return (pos_prompt, neg_prompt, tensor, info_string, workflow_json)
 
 
 # ----- SECTION: Server Routes -----
@@ -317,6 +698,12 @@ async def get_civitai_images_stream(request):
         username = (request.query.get("username", "") or "").strip()
         tags_q = (request.query.get("tags", "") or "").strip()
         query_q = (request.query.get("query", "") or "").strip()
+        types = (request.query.get("types", "") or "").strip()
+        model_types = (request.query.get("modelTypes", "") or "").strip()
+        tag_mode = (request.query.get("tagMode", "") or "").strip()
+        model_id = (request.query.get("modelId", "") or "").strip() or None
+        model_ver_id = (request.query.get("modelVersionId", "") or "").strip() or None
+        post_id = (request.query.get("postId", "") or "").strip() or None
 
         include_videos = truthy(request.query.get("include_videos", "false"))
         hide_no_prompt = truthy(request.query.get("hide_no_prompt", "false"))
@@ -354,13 +741,28 @@ async def get_civitai_images_stream(request):
                 p["modelId"] = model_id
             if model_ver_id:
                 p["modelVersionId"] = model_ver_id
+            if types:
+                p["types"] = types
+            if model_types:
+                p["modelTypes"] = model_types
+            if tag_mode:
+                p["tagMode"] = tag_mode
+            if post_id:
+                p["postId"] = post_id
             if cur:
                 p["cursor"] = cur
             return p
 
         async def fetch_once(session: aiohttp.ClientSession, cur: Optional[str]) -> Dict[str, Any]:
             params = build_params(cur)
-            async with session.get(base_url, params=params) as resp:
+            
+            # Add headers with API key if available
+            headers = {}
+            api_key = get_civitai_api_key()
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            
+            async with session.get(base_url, params=params, headers=headers) as resp:
                 text = await resp.text()
                 if resp.status != 200:
                     return {"items": [], "metadata": {"error": f"upstream {resp.status}", "detail": text[:400]}, "next": None}
@@ -381,46 +783,48 @@ async def get_civitai_images_stream(request):
         dropped = 0
         next_cursor = None
 
-        async with aiohttp.ClientSession() as session:
-            cur = cursor
-            for _ in range(50):
-                res = await fetch_once(session, cur)
-                rec_items = res.get("items", [])
-                next_cursor = res.get("next", None)
+        # 使用统一 HTTP 客户端（自动处理代理）
+        session = await http_client.get_session()
 
-                for it in rec_items:
-                    if not isinstance(it, dict):
+        cur = cursor
+        for _ in range(50):
+            res = await fetch_once(session, cur)
+            rec_items = res.get("items", [])
+            next_cursor = res.get("next", None)
+
+            for it in rec_items:
+                if not isinstance(it, dict):
+                    dropped += 1
+                    continue
+
+                if videos_only:
+                    if not item_is_video(it):
+                        dropped += 1
+                        continue
+                else:
+                    if not include_videos and item_is_video(it):
                         dropped += 1
                         continue
 
-                    if videos_only:
-                        if not item_is_video(it):
-                            dropped += 1
-                            continue
-                    else:
-                        if not include_videos and item_is_video(it):
-                            dropped += 1
-                            continue
+                if hide_no_prompt and not item_has_positive_prompt(it):
+                    dropped += 1
+                    continue
+                if query_q and not item_matches_query_local(it, query_q):
+                    dropped += 1
+                    continue
 
-                    if hide_no_prompt and not item_has_positive_prompt(it):
-                        dropped += 1
-                        continue
-                    if query_q and not item_matches_query_local(it, query_q):
-                        dropped += 1
-                        continue
+                kept.append(it)
 
-                    kept.append(it)
+            if len(kept) >= min_batch:
+                break
 
-                if len(kept) >= min_batch:
-                    break
+            if deadline is not None and time.monotonic() >= deadline and len(kept) > 0:
+                break
 
-                if deadline is not None and time.monotonic() >= deadline and len(kept) > 0:
-                    break
+            if not next_cursor:
+                break
 
-                if not next_cursor:
-                    break
-
-                cur = next_cursor
+            cur = next_cursor
 
         served = kept[:min_batch] if min_batch > 0 else kept
 
@@ -450,15 +854,20 @@ async def check_video_workflow(request):
         return web.json_response({"has_workflow": False, "error": "URL is missing"}, status=400)
     try:
         headers = {"Range": "bytes=0-4194304"}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(video_url, headers=headers) as response:
-                if response.status >= 400 and response.status != 416:
-                    return web.json_response(
-                        {"has_workflow": False, "error": f"Failed to fetch video chunk, status: {response.status}"}
-                    )
-                chunk = await response.content.read()
-                has_workflow = b'"workflow":' in chunk or b'"prompt":' in chunk
-                return web.json_response({"has_workflow": has_workflow})
+        api_key = get_civitai_api_key()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        # 使用统一 HTTP 客户端（自动处理代理）
+        session = await http_client.get_session()
+        async with session.get(video_url, headers=headers) as response:
+            if response.status >= 400 and response.status != 416:
+                return web.json_response(
+                    {"has_workflow": False, "error": f"Failed to fetch video chunk, status: {response.status}"}
+                )
+            chunk = await response.content.read()
+            has_workflow = b'"workflow":' in chunk or b'"prompt":' in chunk
+            return web.json_response({"has_workflow": has_workflow})
     except Exception as e:
         return web.json_response({"has_workflow": False, "error": str(e)}, status=500)
 
@@ -469,19 +878,81 @@ async def get_video_for_workflow(request):
     if not video_url:
         return web.Response(status=400, text="Missing video URL")
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(video_url) as response:
-                if response.status != 200:
-                    return web.Response(status=response.status, text=f"Failed to fetch video from source: {response.reason}")
-                data = await response.read()
-                filename = video_url.split("/")[-1].split("?")[0] or "video_with_workflow.mp4"
-                return web.Response(
-                    body=data,
-                    content_type=response.content_type,
-                    headers={"Content-Disposition": f"attachment; filename=\"{filename}\""},
-                )
+        headers = {}
+        api_key = get_civitai_api_key()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        # 使用统一 HTTP 客户端（自动处理代理）
+        session = await http_client.get_session()
+        async with session.get(video_url, headers=headers) as response:
+            if response.status != 200:
+                return web.Response(status=response.status, text=f"Failed to fetch video from source: {response.reason}")
+            data = await response.read()
+            filename = video_url.split("/")[-1].split("?")[0] or "video_with_workflow.mp4"
+            return web.Response(
+                body=data,
+                content_type=response.content_type,
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
     except Exception as e:
         return web.Response(status=500, text=str(e))
+
+
+@prompt_server.routes.post("/civitai_gallery/reload_proxy")
+async def reload_proxy_endpoint(request):
+    """
+    热切换代理配置端点
+
+    调用此端点会强制重新加载 config.json 中的代理配置，
+    并重建 HTTP 客户端 session，实现无需重启的热切换。
+
+    请求体（可选）：
+    {
+        "config": {  // 临时覆盖配置，不会写入文件
+            "enabled": true,
+            "type": "http",
+            "host": "127.0.0.1",
+            "port": 10808
+        }
+    }
+    """
+    try:
+        data = await request.json() if request.can_read_body else {}
+        temp_config = data.get("config")
+
+        if temp_config and isinstance(temp_config, dict):
+            # 临时覆盖配置（仅内存，不写入文件）
+            global _config_cache
+            if _config_cache is None:
+                _config_cache = {}
+            if "proxy" not in _config_cache:
+                _config_cache["proxy"] = {}
+            _config_cache["proxy"].update(temp_config)
+            print(f"CivitaiDiscoveryHub: Proxy config temporarily updated: {temp_config}")
+
+        # 强制重新加载代理配置
+        result = await http_client.reload_proxy()
+        return web.json_response(result)
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+@prompt_server.routes.get("/civitai_gallery/proxy_status")
+async def get_proxy_status(request):
+    """获取当前代理状态"""
+    try:
+        settings = get_proxy_settings()
+        return web.json_response({
+            "enabled": settings["enabled"],
+            "type": settings["type"],
+            "host": settings["host"],
+            "port": settings["port"],
+            "has_auth": bool(settings["username"] and settings["password"]),
+            "current_proxy_url": http_client._current_proxy.split("@")[-1] if http_client._current_proxy else None,
+        })
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 
 # ----- SECTION: Entry Point (comfy_entrypoint) -----

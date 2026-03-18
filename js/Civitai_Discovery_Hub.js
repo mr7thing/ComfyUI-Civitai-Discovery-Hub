@@ -291,14 +291,23 @@ function ensureHiddenSelectionWidget(node) {
       <label>Tags</label>
       <select class="cg-select cg-tags"><option value="">None</option></select>
 
-      <input class="cg-input cg-username" placeholder="Username">
+      <label>Content Types</label>
+      <select class="cg-select cg-content-types"><option value="">All</option><option value="Image">Image</option><option value="Video">Video</option><option value="GIF">GIF</option></select>
+
+      <label>Model Types</label>
+      <select class="cg-select cg-model-types"><option value="">None</option><option value="Checkpoint">Checkpoint</option><option value="TextualInversion">TextualInversion</option><option value="LORA">LORA</option><option value="VAE">VAE</option></select>
+
+      <label>Tag Mode</label>
+      <select class="cg-select cg-tag-mode"><option value="">None</option><option value="AND">AND</option><option value="OR">OR</option></select>
+
       <button class="cg-btn cg-search">Apply</button>
 
       <span style="flex:1"></span>
 
       <label>Batch</label>
       <select class="cg-select cg-limit">
-        <option value="24" selected>24</option>
+        <option value="12" selected>12</option>
+        <option value="24">24</option>
         <option value="50">50</option>
         <option value="100">100</option>
         <option value="150">150</option>
@@ -310,6 +319,23 @@ function ensureHiddenSelectionWidget(node) {
 
       <button class="cg-btn cg-refresh">Refresh</button>
       <button class="cg-btn cg-toggle-render cg-render-on">Display: ON</button>
+
+      <!-- Advanced Search Panel -->
+      <div class="cg-advanced-panel" style="margin-top: 10px; padding: 10px; border: 1px solid var(--cg-border); border-radius: 14px; background: linear-gradient(135deg, rgba(255,255,255,.04), rgba(255,255,255,.01));">
+        <div class="cg-advanced-controls" style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+          <label>Model ID</label>
+          <input class="cg-input cg-model-id" placeholder="Model ID">
+
+          <label>Model Version ID</label>
+          <input class="cg-input cg-model-version-id" placeholder="Model Version ID">
+
+          <label>Post ID</label>
+          <input class="cg-input cg-post-id" placeholder="Post ID">
+
+          <label>User ID</label>
+          <input class="cg-input cg-username" placeholder="Username">
+        </div>
+      </div>
     </div>
   </div>
 
@@ -340,6 +366,8 @@ function ensureHiddenSelectionWidget(node) {
                 const elSearch = $(".cg-search");
                 const elRefresh = $(".cg-refresh");
                 const elStatus = $(".cg-status");
+                const elModelTypes = $(".cg-model-types");
+                const elTagMode = $(".cg-tag-mode");
 
                 const elScroll = root.querySelector(".cg-scroll");
                 const elGrid = root.querySelector(".cg-masonry");
@@ -350,12 +378,93 @@ function ensureHiddenSelectionWidget(node) {
                 const elBtnFavOnly = $(".cg-toggle-favonly");
                 const elLimitSel = $(".cg-limit");
                 const elBtnRender = $(".cg-toggle-render");
+                const elAdvancedPanel = $(".cg-advanced-panel");
+                const elContentTypes = $(".cg-content-types");
+                const elModelId = $(".cg-model-id");
+                const elModelVersionId = $(".cg-model-version-id");
+                const elPostId = $(".cg-post-id");
+
+                // Save and load filter settings
+                const saveFilterSettings = () => {
+                    cg.filter_settings = {
+                        nsfw: elNSFW.value,
+                        sort: elSort.value,
+                        period: elPeriod.value,
+                        tags: elTags.value,
+                        contentTypes: elContentTypes.value,
+                        modelTypes: elModelTypes.value,
+                        tagMode: elTagMode.value,
+                        username: elUser.value,
+                        modelId: elModelId.value,
+                        modelVersionId: elModelVersionId.value,
+                        postId: elPostId.value,
+                        batchSize: elLimitSel.value,
+                        videosOnly: videosOnly,
+                        hideNoPrompt: hideNoPrompt,
+                        favoritesOnly: favoritesOnly
+                    };
+                };
+
+                const loadFilterSettings = () => {
+                    const settings = cg.filter_settings || {};
+                    
+                    if (settings.nsfw) elNSFW.value = settings.nsfw;
+                    if (settings.sort) elSort.value = settings.sort;
+                    if (settings.period) elPeriod.value = settings.period;
+                    if (settings.tags) elTags.value = settings.tags;
+                    if (settings.contentTypes) elContentTypes.value = settings.contentTypes;
+                    if (settings.modelTypes) elModelTypes.value = settings.modelTypes;
+                    if (settings.tagMode) elTagMode.value = settings.tagMode;
+                    if (settings.username) elUser.value = settings.username;
+                    if (settings.modelId) elModelId.value = settings.modelId;
+                    if (settings.modelVersionId) elModelVersionId.value = settings.modelVersionId;
+                    if (settings.postId) elPostId.value = settings.postId;
+                    if (settings.batchSize) elLimitSel.value = settings.batchSize;
+                    
+                    if (typeof settings.videosOnly === "boolean") {
+                        videosOnly = settings.videosOnly;
+                        toggleBtn(elBtnVideo, videosOnly);
+                    }
+                    
+                    if (typeof settings.hideNoPrompt === "boolean") {
+                        hideNoPrompt = settings.hideNoPrompt;
+                        toggleBtn(elBtnNoPrompt, hideNoPrompt);
+                    }
+                    
+                    if (typeof settings.favoritesOnly === "boolean") {
+                        favoritesOnly = settings.favoritesOnly;
+                        toggleBtn(elBtnFavOnly, favoritesOnly);
+                    }
+                };
+
+                // Load filter settings on init
+                loadFilterSettings();
 
                 let loading = false;
                 let hasMore = true;
                 let favoritesOnly = false;
                 let videosOnly = false;
                 let hideNoPrompt = false;
+
+                // Event listeners to save filter settings
+                const saveOnChange = () => {
+                    saveFilterSettings();
+                };
+
+                // Add event listeners for all filter controls
+                [elNSFW, elSort, elPeriod, elLimitSel, elTags, elContentTypes, elModelTypes, elTagMode].forEach((x) => {
+                    x.addEventListener("change", saveOnChange);
+                });
+
+                // Add event listeners for input fields
+                [elUser, elModelId, elModelVersionId, elPostId].forEach((x) => {
+                    x.addEventListener("input", saveOnChange);
+                });
+
+                // Add event listeners for toggle buttons
+                elBtnVideo.addEventListener("click", saveOnChange);
+                elBtnNoPrompt.addEventListener("click", saveOnChange);
+                elBtnFavOnly.addEventListener("click", saveOnChange);
 
                 let favoritesMap = {};
                 let favoritesArray = [];
@@ -540,6 +649,10 @@ function ensureHiddenSelectionWidget(node) {
                         time_budget_ms: videosOnly ? "1200" : "",
                     };
                     if (elTags.value) params.tags = elTags.value;
+                    if (elContentTypes.value) params.types = elContentTypes.value;
+                    if (elModelId.value) params.modelId = elModelId.value.trim();
+                    if (elModelVersionId.value) params.modelVersionId = elModelVersionId.value.trim();
+                    if (elPostId.value) params.postId = elPostId.value.trim();
                     return `/civitai_gallery/images_stream?${qs(params)}`;
                 };
 
@@ -679,6 +792,12 @@ function ensureHiddenSelectionWidget(node) {
                     left.className = "cg-meta-left";
                     left.appendChild(chip(getItemNsfw(it)));
                     left.appendChild(chip(new Date(it.createdAt || Date.now()).toLocaleDateString()));
+                    
+                    // 检查是否包含工作流
+                    const hasWorkflow = Boolean(it?.meta?.comfy);
+                    if (hasWorkflow) {
+                        left.appendChild(chip("🧩 Workflow"));
+                    }
 
                     const open = document.createElement("a");
                     open.className = "cg-open";

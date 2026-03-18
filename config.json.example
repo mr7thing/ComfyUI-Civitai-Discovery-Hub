@@ -1,0 +1,10 @@
+{
+    "api_key": "",
+    "proxy": {
+        "enabled": false,
+        "host": "127.0.0.1",
+        "port": 10808,
+        "username": "",
+        "password": ""
+    }
+}
