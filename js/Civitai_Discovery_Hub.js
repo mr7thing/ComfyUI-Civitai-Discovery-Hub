@@ -315,7 +315,8 @@ function ensureHiddenSelectionWidget(node) {
 
       <button class="cg-btn toggle cg-toggle-video">Videos only</button>
       <button class="cg-btn toggle cg-toggle-noprompt">Hide no-prompt</button>
-      <button class="cg-btn toggle cg-toggle-favonly">Favorites only</button>
+      <button class="cg-btn cg-toggle-favonly">Favorites only</button>
+      <button class="cg-btn toggle cg-toggle-proxy">Proxy: OFF</button>
 
       <button class="cg-btn cg-refresh">Refresh</button>
       <button class="cg-btn cg-toggle-render cg-render-on">Display: ON</button>
@@ -376,6 +377,7 @@ function ensureHiddenSelectionWidget(node) {
                 const elBtnVideo = $(".cg-toggle-video");
                 const elBtnNoPrompt = $(".cg-toggle-noprompt");
                 const elBtnFavOnly = $(".cg-toggle-favonly");
+                const elBtnProxy = $(".cg-toggle-proxy");
                 const elLimitSel = $(".cg-limit");
                 const elBtnRender = $(".cg-toggle-render");
                 const elAdvancedPanel = $(".cg-advanced-panel");
@@ -445,6 +447,7 @@ function ensureHiddenSelectionWidget(node) {
                 let favoritesOnly = false;
                 let videosOnly = false;
                 let hideNoPrompt = false;
+                let useProxy = false;
 
                 // Event listeners to save filter settings
                 const saveOnChange = () => {
@@ -647,6 +650,7 @@ function ensureHiddenSelectionWidget(node) {
                         videos_only: videosOnly ? "true" : "false",
                         hide_no_prompt: hideNoPrompt ? "true" : "false",
                         time_budget_ms: videosOnly ? "1200" : "",
+                        use_proxy: useProxy ? "true" : "false",
                     };
                     if (elTags.value) params.tags = elTags.value;
                     if (elContentTypes.value) params.types = elContentTypes.value;
@@ -1128,6 +1132,13 @@ function ensureHiddenSelectionWidget(node) {
                 elBtnFavOnly.addEventListener("click", async () => {
                     favoritesOnly = !favoritesOnly;
                     toggleBtn(elBtnFavOnly, favoritesOnly);
+                    await reload(true);
+                });
+
+                elBtnProxy.addEventListener("click", async () => {
+                    useProxy = !useProxy;
+                    toggleBtn(elBtnProxy, useProxy);
+                    elBtnProxy.textContent = `Proxy: ${useProxy ? "ON" : "OFF"}`;
                     await reload(true);
                 });
 

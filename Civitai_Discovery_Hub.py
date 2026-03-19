@@ -87,35 +87,38 @@ def get_proxy_settings() -> Dict[str, Any]:
         proxy_settings = {}
     
     return {
-        "enabled": bool(proxy_settings.get("enabled", False)),
         "type": str(proxy_settings.get("type", "http")).lower(),
-        "host": str(proxy_settings.get("host", "127.0.0.1")),
-        "port": int(proxy_settings.get("port", 10808)),
+        "host": str(proxy_settings.get("host", "")),
+        "port": int(proxy_settings.get("port", 0)),
         "username": str(proxy_settings.get("username", "")) if proxy_settings.get("username") else None,
         "password": str(proxy_settings.get("password", "")) if proxy_settings.get("password") else None,
     }
 
 
 def get_proxy_url() -> Optional[str]:
-    """Get proxy URL string, returns None if proxy is disabled"""
+    """Get proxy URL string. Returns URL if host+port configured, regardless of enabled flag."""
     settings = get_proxy_settings()
-    if not settings["enabled"]:
+    host = settings.get("host", "")
+    port = settings.get("port", 0)
+    
+    if not host or not port:
         return None
     
     auth = ""
     if settings["username"] and settings["password"]:
         auth = f"{settings['username']}:{settings['password']}@"
     
-    return f"{settings['type']}://{auth}{settings['host']}:{settings['port']}"
+    return f"{settings['type']}://{auth}{host}:{port}"
 
 
 # ----- SECTION: Unified HTTP Client -----
 class CivitaiHttpClient:
     """
-    统一管理的 HTTP 客户端，支持代理热切换
+    统一管理的 HTTP 客户端，支持代理热切换和按需代理开关
     
     设计原则：
     - 单例模式：全局唯一实例
+    - 双 Session 设计：一个走代理，一个直连
     - 自动代理检测：配置变化时自动重建 session
     - 连接池复用：减少 TCP 握手开销
     """
@@ -126,7 +129,8 @@ class CivitaiHttpClient:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance._session: Optional[aiohttp.ClientSession] = None
+            cls._instance._session_with_proxy: Optional[aiohttp.ClientSession] = None
+            cls._instance._session_direct: Optional[aiohttp.ClientSession] = None
             cls._instance._current_proxy: Optional[str] = None
             cls._instance._closed = False
         return cls._instance
@@ -139,91 +143,110 @@ class CivitaiHttpClient:
             headers["Authorization"] = f"Bearer {api_key}"
         return headers
     
-    async def get_session(self) -> aiohttp.ClientSession:
-        """获取或创建 session，自动检测代理变化并重建"""
+    async def _create_session(self, proxy_url: Optional[str]) -> aiohttp.ClientSession:
+        """创建带有指定代理的 session"""
+        if proxy_url:
+            connector = aiohttp.TCPConnector(
+                proxy=proxy_url,
+                limit=100,
+                limit_per_host=30,
+                ttl_dns_cache=300,
+            )
+            print(f"CivitaiDiscoveryHub: Creating session with proxy {proxy_url.split('@')[-1]}")
+        else:
+            connector = aiohttp.TCPConnector(
+                limit=100,
+                limit_per_host=30,
+                ttl_dns_cache=300,
+            )
+            print("CivitaiDiscoveryHub: Creating direct session")
+        
+        timeout = aiohttp.ClientTimeout(total=60, connect=10)
+        return aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers=self._get_auth_headers(),
+        )
+    
+    async def get_session(self, use_proxy: bool = False) -> aiohttp.ClientSession:
+        """
+        获取或创建 session
+        
+        Args:
+            use_proxy: 是否使用代理
+        """
         async with self._lock:
             if self._closed:
                 raise RuntimeError("HttpClient has been closed")
             
-            proxy_url = get_proxy_url()
+            proxy_url = get_proxy_url() if use_proxy else None
             
-            # 代理配置变化时需要重建 session
-            need_rebuild = (
-                proxy_url != self._current_proxy
-                or self._session is None
-                or self._session.closed
-            )
-            
-            if need_rebuild:
-                # 关闭旧 session
-                if self._session and not self._session.closed:
-                    await self._session.close()
+            if use_proxy:
+                # 走代理的 session
+                if proxy_url is None:
+                    raise ValueError("Proxy requested but no proxy configured in config.json")
                 
-                # 创建新 connector
-                if proxy_url:
-                    connector = aiohttp.TCPConnector(
-                        proxy=proxy_url,
-                        limit=100,
-                        limit_per_host=30,
-                        ttl_dns_cache=300,
-                    )
-                    print(f"CivitaiDiscoveryHub: HTTP client using proxy {proxy_url.split('@')[-1]}")
-                else:
-                    connector = aiohttp.TCPConnector(
-                        limit=100,
-                        limit_per_host=30,
-                        ttl_dns_cache=300,
-                    )
-                    print("CivitaiDiscoveryHub: HTTP client using direct connection")
-                
-                # 创建新 session
-                timeout = aiohttp.ClientTimeout(total=60, connect=10)
-                self._session = aiohttp.ClientSession(
-                    connector=connector,
-                    timeout=timeout,
-                    headers=self._get_auth_headers(),
+                need_rebuild = (
+                    proxy_url != self._current_proxy
+                    or self._session_with_proxy is None
+                    or self._session_with_proxy.closed
                 )
-                self._current_proxy = proxy_url
-            
-            return self._session
+                
+                if need_rebuild:
+                    if self._session_with_proxy and not self._session_with_proxy.closed:
+                        await self._session_with_proxy.close()
+                    self._session_with_proxy = await self._create_session(proxy_url)
+                    self._current_proxy = proxy_url
+                
+                return self._session_with_proxy
+            else:
+                # 直连的 session
+                if self._session_direct is None or self._session_direct.closed:
+                    self._session_direct = await self._create_session(None)
+                
+                return self._session_direct
     
     async def request(
         self,
         method: str,
         url: str,
+        use_proxy: bool = False,
         **kwargs
     ) -> aiohttp.ClientResponse:
         """发送 HTTP 请求"""
-        session = await self.get_session()
+        session = await self.get_session(use_proxy=use_proxy)
         return await session.request(method, url, **kwargs)
     
-    async def get(self, url: str, **kwargs) -> aiohttp.ClientResponse:
+    async def get(self, url: str, use_proxy: bool = False, **kwargs) -> aiohttp.ClientResponse:
         """发送 GET 请求"""
-        return await self.request("GET", url, **kwargs)
+        return await self.request("GET", url, use_proxy=use_proxy, **kwargs)
     
-    async def post(self, url: str, **kwargs) -> aiohttp.ClientResponse:
+    async def post(self, url: str, use_proxy: bool = False, **kwargs) -> aiohttp.ClientResponse:
         """发送 POST 请求"""
-        return await self.request("POST", url, **kwargs)
+        return await self.request("POST", url, use_proxy=use_proxy, **kwargs)
     
     async def close(self):
         """关闭客户端，释放资源"""
         async with self._lock:
             self._closed = True
-            if self._session and not self._session.closed:
-                await self._session.close()
-                self._session = None
+            if self._session_with_proxy and not self._session_with_proxy.closed:
+                await self._session_with_proxy.close()
+                self._session_with_proxy = None
+            if self._session_direct and not self._session_direct.closed:
+                await self._session_direct.close()
+                self._session_direct = None
             self._current_proxy = None
     
     async def reload_proxy(self) -> Dict[str, Any]:
         """强制重新加载代理配置并重建 session"""
         reload_config()
         async with self._lock:
-            self._current_proxy = None  # 强制触发重建
-        session = await self.get_session()
+            self._current_proxy = None
+        proxy_url = get_proxy_url()
         return {
             "status": "success",
-            "proxy": self._current_proxy.split("@")[-1] if self._current_proxy else None,
-            "enabled": self._current_proxy is not None,
+            "proxy": proxy_url.split("@")[-1] if proxy_url else None,
+            "enabled": proxy_url is not None,
         }
 
 
@@ -309,11 +332,14 @@ def _empty_image_tensor() -> torch.Tensor:
     return torch.zeros(1, 1, 1, 3, dtype=torch.float32)
 
 
-def _download_image_to_tensor(url: str, timeout_s: int = 30) -> torch.Tensor:
+def _download_image_to_tensor(url: str, timeout_s: int = 30, use_proxy: bool = False) -> torch.Tensor:
     """
     同步下载图片并转换为 tensor
     
-    使用缓存的代理配置，在 ComfyUI 同步环境中运行。
+    Args:
+        url: 图片 URL
+        timeout_s: 超时秒数
+        use_proxy: 是否使用代理（覆盖全局配置）
     """
     import urllib.request
     
@@ -322,11 +348,12 @@ def _download_image_to_tensor(url: str, timeout_s: int = 30) -> torch.Tensor:
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     
-    proxy_url = get_proxy_url()
     proxy_handler = None
     
-    if proxy_url:
-        proxy_handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    if use_proxy:
+        proxy_url = get_proxy_url()
+        if proxy_url:
+            proxy_handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
     
     opener = urllib.request.build_opener(proxy_handler) if proxy_handler else urllib.request.build_opener()
     req = urllib.request.Request(url, headers=headers)
@@ -476,7 +503,12 @@ class CivitaiDiscoveryHubNode(comfy_io.ComfyNode):
                     default="{}",
                     multiline=True,
                     tooltip="JSON payload set by the UI (selected item + flags).",
-                )
+                ),
+                comfy_io.Boolean.Input(
+                    "use_proxy",
+                    default=False,
+                    tooltip="Enable proxy for this request (overrides global config).",
+                ),
             ],
             outputs=[
                 comfy_io.String.Output(display_name="positive_prompt"),
@@ -488,11 +520,11 @@ class CivitaiDiscoveryHubNode(comfy_io.ComfyNode):
         )
 
     @classmethod
-    def is_changed(cls, selection_data: str, **kwargs):
-        return selection_data
+    def is_changed(cls, selection_data: str, use_proxy: bool = False, **kwargs):
+        return f"{selection_data}:{use_proxy}"
 
     @classmethod
-    def execute(cls, selection_data: str):
+    def execute(cls, selection_data: str, use_proxy: bool = False):
         try:
             node_selection = json.loads(selection_data or "{}")
         except Exception:
@@ -543,6 +575,18 @@ class CivitaiDiscoveryHubNode(comfy_io.ComfyNode):
         if has_workflow:
             info_dict["has_workflow"] = True
 
+        proxy_settings = get_proxy_settings()
+        proxy_url = get_proxy_url()
+        proxy_type = proxy_settings.get("type", "http")
+        proxy_host = proxy_settings.get("host", "")
+
+        if use_proxy and proxy_url:
+            info_dict["proxy_status"] = f"🟢 Connected via {proxy_type.upper()} proxy: {proxy_host}"
+        elif use_proxy and not proxy_url:
+            info_dict["proxy_status"] = "🟡 Proxy enabled but not configured in config.json"
+        else:
+            info_dict["proxy_status"] = "⚪ Proxy disabled (direct connection)"
+
         try:
             info_string = json.dumps(info_dict, indent=4, ensure_ascii=False)
         except Exception:
@@ -552,8 +596,9 @@ class CivitaiDiscoveryHubNode(comfy_io.ComfyNode):
 
         if should_download and image_url:
             try:
-                tensor = _download_image_to_tensor(image_url, timeout_s=30)
-            except Exception:
+                tensor = _download_image_to_tensor(image_url, timeout_s=30, use_proxy=use_proxy and bool(proxy_url))
+            except Exception as e:
+                print(f"CivitaiDiscoveryHub: Image download error: {e}")
                 tensor = _empty_image_tensor()
 
         return (pos_prompt, neg_prompt, tensor, info_string, workflow_json)
@@ -702,6 +747,7 @@ async def get_civitai_images_stream(request):
         include_videos = truthy(request.query.get("include_videos", "false"))
         hide_no_prompt = truthy(request.query.get("hide_no_prompt", "false"))
         videos_only = truthy(request.query.get("videos_only", "false"))
+        use_proxy = truthy(request.query.get("use_proxy", "false"))
 
         cursor = request.query.get("cursor", None)
         min_batch = clamp_int(request.query.get("min_batch", "50"), 1, 500, 50)
@@ -778,7 +824,7 @@ async def get_civitai_images_stream(request):
         next_cursor = None
 
         # 使用统一 HTTP 客户端（自动处理代理）
-        session = await http_client.get_session()
+        session = await http_client.get_session(use_proxy=use_proxy)
 
         cur = cursor
         for _ in range(50):
@@ -844,6 +890,7 @@ async def get_civitai_images_stream(request):
 async def check_video_workflow(request):
     data = await request.json()
     video_url = data.get("url")
+    use_proxy = truthy(data.get("use_proxy", "false"))
     if not video_url:
         return web.json_response({"has_workflow": False, "error": "URL is missing"}, status=400)
     try:
@@ -853,7 +900,7 @@ async def check_video_workflow(request):
             headers["Authorization"] = f"Bearer {api_key}"
 
         # 使用统一 HTTP 客户端（自动处理代理）
-        session = await http_client.get_session()
+        session = await http_client.get_session(use_proxy=use_proxy)
         async with session.get(video_url, headers=headers) as response:
             if response.status >= 400 and response.status != 416:
                 return web.json_response(
@@ -869,6 +916,7 @@ async def check_video_workflow(request):
 @prompt_server.routes.get("/civitai_gallery/get_video_for_workflow")
 async def get_video_for_workflow(request):
     video_url = request.query.get("url")
+    use_proxy = truthy(request.query.get("use_proxy", "false"))
     if not video_url:
         return web.Response(status=400, text="Missing video URL")
     try:
@@ -878,7 +926,7 @@ async def get_video_for_workflow(request):
             headers["Authorization"] = f"Bearer {api_key}"
 
         # 使用统一 HTTP 客户端（自动处理代理）
-        session = await http_client.get_session()
+        session = await http_client.get_session(use_proxy=use_proxy)
         async with session.get(video_url, headers=headers) as response:
             if response.status != 200:
                 return web.Response(status=response.status, text=f"Failed to fetch video from source: {response.reason}")
