@@ -309,14 +309,30 @@ def _empty_image_tensor() -> torch.Tensor:
     return torch.zeros(1, 1, 1, 3, dtype=torch.float32)
 
 
-async def _download_image_to_tensor_async(url: str, timeout_s: int = 30) -> torch.Tensor:
-    """异步下载图片并转换为 tensor，使用统一 HTTP 客户端"""
-    session = await http_client.get_session()
+def _download_image_to_tensor(url: str, timeout_s: int = 30) -> torch.Tensor:
+    """
+    同步下载图片并转换为 tensor
     
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
-        if resp.status != 200:
-            raise RuntimeError(f"Failed to download image: HTTP {resp.status}")
-        data = await resp.read()
+    使用缓存的代理配置，在 ComfyUI 同步环境中运行。
+    """
+    import urllib.request
+    
+    headers = {"User-Agent": "Mozilla/5.0"}
+    api_key = get_civitai_api_key()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    
+    proxy_url = get_proxy_url()
+    proxy_handler = None
+    
+    if proxy_url:
+        proxy_handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    
+    opener = urllib.request.build_opener(proxy_handler) if proxy_handler else urllib.request.build_opener()
+    req = urllib.request.Request(url, headers=headers)
+    
+    with opener.open(req, timeout=timeout_s) as resp:
+        data = resp.read()
     
     img = Image.open(io.BytesIO(data))
     if getattr(img, "is_animated", False):
@@ -327,29 +343,6 @@ async def _download_image_to_tensor_async(url: str, timeout_s: int = 30) -> torc
     img = img.convert("RGB")
     arr = np.array(img).astype(np.float32) / 255.0
     return torch.from_numpy(arr)[None, ...]
-
-
-def _download_image_to_tensor(url: str, timeout_s: int = 30) -> torch.Tensor:
-    """
-    同步包装器：在独立线程中运行异步下载
-    
-    注意：此函数在 ComfyUI 节点执行时被调用，需要兼容同步上下文。
-    ComfyUI 可能已经有一个事件循环在运行，所以我们需要在新线程中运行 asyncio。
-    """
-    import concurrent.futures
-    
-    def run_async_in_thread():
-        """在新线程中运行异步函数"""
-        new_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(new_loop)
-        try:
-            return new_loop.run_until_complete(_download_image_to_tensor_async(url, timeout_s))
-        finally:
-            new_loop.close()
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(run_async_in_thread)
-        return future.result()
 
 
 def extract_prompts_from_workflow(workflow_json: str) -> tuple[str, str]:
