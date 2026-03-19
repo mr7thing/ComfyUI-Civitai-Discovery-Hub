@@ -863,6 +863,11 @@ function ensureHiddenSelectionWidget(node) {
                     d.appendChild(meta);
 
                     d.addEventListener("click", () => selectItem(it, d));
+                    d.addEventListener("dblclick", (e) => {
+                        e.preventDefault();
+                        selectItem(it, d);
+                        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, ctrlKey: true, bubbles: true }));
+                    });
                     requestAnimationFrame(() => d.classList.add("show"));
                     return d;
                 };
